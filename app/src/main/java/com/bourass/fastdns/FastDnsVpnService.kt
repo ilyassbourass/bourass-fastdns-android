@@ -116,15 +116,18 @@ class FastDnsVpnService : VpnService() {
         // 2. Connect the FastDNS engine (TCP to resolver)
         eng.connect()
 
-        // Wait for connection
+        // Wait for connection (up to 25 seconds for cellular DNS recursion)
         var waitCount = 0
-        while (!eng.isConnected.get() && waitCount < 100 && running) {
+        while (!eng.isConnected.get() && waitCount < 250 && running) {
             Thread.sleep(100)
             waitCount++
         }
 
         if (!eng.isConnected.get()) {
             Log.e(TAG, "Engine did not connect in time")
+            updateNotification("Error: Connection timed out")
+            statusCallback?.invoke("Error: Connection timed out")
+            stopTunnel()
             return
         }
 
