@@ -1,5 +1,6 @@
 package com.bourass.fastdns
 
+import android.net.VpnService
 import android.util.Log
 import java.io.*
 import java.net.InetSocketAddress
@@ -11,16 +12,15 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * FastDNS Tunnel Engine — reverse-engineered directly from FaizVPN wire traffic.
+ * FastDNS Tunnel Engine with auto-reconnect and VpnService socket protection.
  *
- * Wire Architecture:
- *   - Single multiplexed TCP socket on port 53 (matches Faiz's sport 49137).
- *   - Resolvers: 105.73.34.106 (primary in pcap), 105.73.34.105, 213.160.77.162.
- *   - Session: client-generated 32-hex ID + decimal shortSess for polling.
- *   - Uplink: 0-<b32>.s<sessionHex>.<zone>.
- *   - Downlink Poll: 0-poll.<shortSess>.<pollSeq>.<rand>.s<assignedIp>.<zone>.
+ * Direct match to FaizVPN pcap architecture:
+ *   - Single multiplexed TCP stream on 105.73.34.106:53.
+ *   - Transparent socket auto-reconnect on EOF / RST.
+ *   - Sockets protected from VPN loopback via VpnService.protect().
  */
 class FastDnsEngine(
+    private val vpnService: VpnService,
     private val resolverIp: String = "105.73.34.106",
     private val resolverPort: Int = 53,
     private val zone: String = "dns3.marocdns.uk",
@@ -48,13 +48,14 @@ class FastDnsEngine(
     private var uplinkSeq = AtomicInteger((1..1000).random())
     private var pollSeq = AtomicInteger(0)
 
-    // Single multiplexed TCP connection (matches FaizVPN pcap architecture)
-    private var tcpSocket: Socket? = null
-    private var tcpOut: OutputStream? = null
-    private var tcpIn: InputStream? = null
+    // Socket state
+    private var activeSocket: Socket? = null
+    private var socketOut: OutputStream? = null
+    private var socketIn: InputStream? = null
     private val socketLock = Any()
+    private var currentTargetIndex = 0
 
-    // State
+    // Lifecycle state
     val isConnected = AtomicBoolean(false)
     val bytesSent = AtomicLong(0)
     val bytesReceived = AtomicLong(0)
@@ -85,14 +86,17 @@ class FastDnsEngine(
         running.set(false)
         isConnected.set(false)
 
-        synchronized(socketLock) {
-            try { tcpSocket?.close() } catch (_: Exception) {}
-            tcpSocket = null
-            tcpOut = null
-            tcpIn = null
-        }
-
+        closeSocket()
         onStatusChange?.invoke("Disconnected")
+    }
+
+    private fun closeSocket() {
+        synchronized(socketLock) {
+            try { activeSocket?.close() } catch (_: Exception) {}
+            activeSocket = null
+            socketOut = null
+            socketIn = null
+        }
     }
 
     private fun performConnect() {
@@ -101,99 +105,84 @@ class FastDnsEngine(
         subKey = FastDnsCrypto.deriveSubKey(subId)
         hsKey = FastDnsCrypto.deriveHandshakeKey(subKey, installId)
 
-        // Generate session ID (32 hex characters, e.g. 07e72e1acfa2565f865df3065097729e)
         val sBytes = ByteArray(16)
         SecureRandom().nextBytes(sBytes)
         sessionHex = FastDnsCrypto.bytesToHex(sBytes)
 
-        // Derive short session ID for polling queries (first 4 hex chars as decimal)
         shortSess = try {
             Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
         } catch (e: Exception) {
             "39928"
         }
 
-        // Assigned tunnel IP (in 10.8.x.x range as verified in pcap)
         val octet3 = (10..240).random()
         val octet4 = (10..240).random()
         assignedIp = "10.8.$octet3.$octet4"
 
-        // Derive session key
         sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
 
         Log.i(TAG, "Session initialized: sid=$sessionHex, shortSess=$shortSess, assignedIp=$assignedIp")
-        Log.d(TAG, "SessionKey: ${FastDnsCrypto.bytesToHex(sessionKey!!).take(16)}...")
 
-        // Target resolvers
-        val targets = mutableListOf<String>()
-        if (resolverIp.isNotEmpty() && resolverIp !in targets) targets.add(resolverIp)
-        for (t in RESOLVER_TARGETS) {
-            if (t !in targets) targets.add(t)
-        }
-
-        var connected = false
-        var activeTarget = ""
-
-        for (target in targets) {
-            if (!running.get()) return
-            onStatusChange?.invoke("Connecting to $target:$resolverPort...")
-            Log.i(TAG, "Connecting to $target:$resolverPort")
-
-            try {
-                synchronized(socketLock) {
-                    try { tcpSocket?.close() } catch (_: Exception) {}
-                    val s = Socket()
-                    s.tcpNoDelay = true
-                    s.soTimeout = 15000
-                    s.connect(InetSocketAddress(target, resolverPort), 6000)
-                    tcpSocket = s
-                    tcpOut = BufferedOutputStream(s.getOutputStream(), 16384)
-                    tcpIn = BufferedInputStream(s.getInputStream(), 32768)
-                }
-
-                activeTarget = target
-                connected = true
-                Log.i(TAG, "TCP connected to $target:$resolverPort")
-                break
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to connect to $target: ${e.message}")
-            }
-        }
-
-        if (!connected) {
-            onError?.invoke("Could not reach any DNS server")
+        // Connect initial socket
+        if (!ensureConnected()) {
+            onError?.invoke("Could not reach DNS server")
             disconnect()
             return
         }
 
-        // Send activation poll query to register session
-        onStatusChange?.invoke("Activating FastDNS session...")
-        val rand = (100000..999999).random()
-        val initPollQname = "0-poll.$shortSess.0.$rand.s$assignedIp.$zone"
-        Log.i(TAG, "Sending activation poll: $initPollQname")
-
-        try {
-            val response = synchronized(socketLock) {
-                if (tcpOut != null && tcpIn != null) {
-                    sendDnsQuery(tcpOut!!, tcpIn!!, initPollQname)
-                } else null
-            }
-            Log.i(TAG, "Activation poll response: len=${response?.size} text=${response?.let { String(it, Charsets.UTF_8) }}")
-        } catch (e: Exception) {
-            Log.w(TAG, "Activation poll notice: ${e.message} (proceeding with tunnel)")
-        }
-
         isConnected.set(true)
         onStatusChange?.invoke("FastDNS Connected ✓ ($assignedIp)")
-        Log.i(TAG, "FastDNS tunnel is ACTIVE via $activeTarget")
+        Log.i(TAG, "FastDNS tunnel is ACTIVE")
 
         // Start downlink poll loop
         Thread(Runnable { pollLoop() }, "FastDNS-Poll").start()
     }
 
     /**
-     * Send uplink data through the FastDNS tunnel.
-     * Query: 0-<b32_labels>.s<sid>.<zone>.
+     * Ensures the TCP socket is connected and protected from VPN routing.
+     * Automatically reconnects and rotates servers on connection drops.
+     */
+    private fun ensureConnected(): Boolean {
+        synchronized(socketLock) {
+            if (activeSocket != null && activeSocket!!.isConnected && !activeSocket!!.isClosed) {
+                return true
+            }
+
+            closeSocket()
+
+            val targets = RESOLVER_TARGETS
+            for (i in targets.indices) {
+                val idx = (currentTargetIndex + i) % targets.size
+                val target = targets[idx]
+
+                try {
+                    Log.i(TAG, "Connecting TCP socket to $target:$resolverPort")
+                    val s = Socket()
+                    s.tcpNoDelay = true
+                    s.soTimeout = 10000
+
+                    // Protect socket from VPN routing before connecting
+                    vpnService.protect(s)
+
+                    s.connect(InetSocketAddress(target, resolverPort), 5000)
+
+                    activeSocket = s
+                    socketOut = BufferedOutputStream(s.getOutputStream(), 16384)
+                    socketIn = BufferedInputStream(s.getInputStream(), 32768)
+                    currentTargetIndex = idx
+                    Log.i(TAG, "Socket connected and protected for $target:$resolverPort")
+                    return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "Connect to $target failed: ${e.message}")
+                }
+            }
+
+            return false
+        }
+    }
+
+    /**
+     * Send uplink IP packet through FastDNS tunnel.
      */
     fun sendUplink(data: ByteArray) {
         if (!isConnected.get() || sessionKey == null) return
@@ -210,36 +199,33 @@ class FastDnsEngine(
             val frameBytes = ByteArray(frame.remaining())
             frame.get(frameBytes)
 
-            // Encrypt with session key
             val nonce = ByteArray(12)
             SecureRandom().nextBytes(nonce)
             val encrypted = FastDnsCrypto.aesGcmEncrypt(sessionKey!!, nonce, frameBytes)
             val payload = byteArrayOf(0xF1.toByte()) + nonce + encrypted
 
-            // Encode as Base32 and split into ≤60 char labels
             val b32 = FastDnsCrypto.base32Encode(payload)
             val labels = FastDnsCrypto.splitIntoLabels(b32, 60)
 
             val qname = "0-${labels.joinToString(".")}.s$sessionHex.$zone"
 
             synchronized(socketLock) {
-                if (tcpOut != null) {
-                    sendDnsQueryNoWait(tcpOut!!, qname)
+                if (ensureConnected() && socketOut != null) {
+                    sendDnsQueryNoWait(socketOut!!, qname)
+                    bytesSent.addAndGet(data.size.toLong())
                 }
             }
-
-            bytesSent.addAndGet(data.size.toLong())
         } catch (e: Exception) {
             Log.e(TAG, "Uplink send error: ${e.message}")
+            closeSocket() // Force reconnect on next send
         }
     }
 
     /**
      * Downlink polling loop.
-     * Query: 0-poll.<shortSess>.<pollSeq>.<rand>.s<ip>.<zone>.
      */
     private fun pollLoop() {
-        Log.i(TAG, "Poll loop running: shortSess=$shortSess, ip=$assignedIp")
+        Log.i(TAG, "Poll loop started for shortSess=$shortSess, ip=$assignedIp")
 
         while (running.get() && isConnected.get()) {
             try {
@@ -248,20 +234,22 @@ class FastDnsEngine(
 
                 val qname = "0-poll.$shortSess.$pSeq.$rand.s$assignedIp.$zone"
 
-                val response = synchronized(socketLock) {
-                    if (tcpOut != null && tcpIn != null) {
-                        sendDnsQuery(tcpOut!!, tcpIn!!, qname)
-                    } else null
+                var response: ByteArray? = null
+                synchronized(socketLock) {
+                    if (ensureConnected() && socketOut != null && socketIn != null) {
+                        response = sendDnsQuery(socketOut!!, socketIn!!, qname)
+                    }
                 }
 
                 if (response != null && response.isNotEmpty()) {
-                    processDownlink(response)
+                    processDownlink(response!!)
                 }
 
                 Thread.sleep(80)
             } catch (e: Exception) {
                 if (running.get()) {
-                    Log.e(TAG, "Poll error: ${e.message}")
+                    Log.w(TAG, "Poll notice: ${e.message} — reconnecting socket")
+                    closeSocket()
                     Thread.sleep(300)
                 }
             }
@@ -274,10 +262,7 @@ class FastDnsEngine(
         if (data.size <= 4) return
         val text = String(data, Charsets.UTF_8)
         if (text == "ok") return
-        if (text == "gone") {
-            Log.w(TAG, "Server returned 'gone'")
-            return
-        }
+        if (text == "gone") return
 
         var payload = data
         if (payload.size > 2 && (payload[0].toInt() and 0xFF) == 0xF1) {
@@ -334,26 +319,22 @@ class FastDnsEngine(
     private fun buildDnsPacket(txId: Int, qname: String): ByteArray {
         val buf = ByteArrayOutputStream()
 
-        // 12-byte DNS header
         buf.write(byteArrayOf((txId shr 8).toByte(), (txId and 0xFF).toByte()))
-        buf.write(byteArrayOf(0x01, 0x00)) // Standard query, RD=1
-        buf.write(byteArrayOf(0x00, 0x01)) // QDCOUNT = 1
+        buf.write(byteArrayOf(0x01, 0x00))
+        buf.write(byteArrayOf(0x00, 0x01))
         buf.write(byteArrayOf(0x00, 0x00))
         buf.write(byteArrayOf(0x00, 0x00))
         buf.write(byteArrayOf(0x00, 0x00))
 
-        // Question: QNAME
         for (label in qname.trimEnd('.').split(".")) {
             val bytes = label.toByteArray(Charsets.UTF_8)
             buf.write(bytes.size)
             buf.write(bytes)
         }
-        buf.write(0x00) // Root
+        buf.write(0x00)
 
-        // QTYPE = 10 (NULL)
-        buf.write(byteArrayOf(0x00, 0x0A))
-        // QCLASS = 1 (IN)
-        buf.write(byteArrayOf(0x00, 0x01))
+        buf.write(byteArrayOf(0x00, 0x0A)) // QTYPE 10 (NULL)
+        buf.write(byteArrayOf(0x00, 0x01)) // QCLASS 1 (IN)
 
         return buf.toByteArray()
     }
@@ -425,5 +406,5 @@ class FastDnsEngine(
         return offset
     }
 
-    fun getSocket(): Socket? = tcpSocket
+    fun getSocket(): Socket? = activeSocket
 }

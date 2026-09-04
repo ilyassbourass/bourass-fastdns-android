@@ -98,7 +98,7 @@ class FastDnsVpnService : VpnService() {
 
     private fun performTunnelSetup() {
         // 1. Create FastDNS engine
-        val eng = FastDnsEngine()
+        val eng = FastDnsEngine(this)
         engine = eng
 
         eng.onStatusChange = { status ->
