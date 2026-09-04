@@ -14,19 +14,19 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * FastDNS Tunnel Engine — reverse-engineered from FaizVPN v1.11.0.
  *
- * Handshake Wire Protocol:
- *   Query: 0-handshake-batch-lz4.<subId>.<installId>.0.110.<certPart1>.<certPart2>.<zone>.
- *   Response: DNS NULL record starting with 0xF1, followed by 12-byte IV + AES-GCM ciphertext.
- *   Plaintext: JSON {"sid": "...", "ip": "...", "cfg_enc": "...", ...}
+ * Wire Protocol:
+ *   Handshake: 0-handshake-batch-zstd.<subId>.<installId>.0.110.<certPart1>.<certPart2>.<zone>.
+ *              Sent directly to authoritative server (213.160.77.162:53) over TCP.
+ *              Response: 0xF1 + 12B IV + AES-GCM ciphertext -> JSON {"sid": "...", "ip": "..."}
  *
- * Uplink:
- *   Query: 0-<b32_labels>.s<sid>.<zone>.
+ *   Downlink Poll: 0-poll.<shortSess>.<pollSeq>.<rand>.s<assignedIp>.<zone>.
+ *              shortSess = decimal integer of first 4 hex chars of sid (e.g. 0x3bd6 -> 15318)
+ *              Response: NULL record with 0xF1 + 12B IV + AES-GCM ciphertext containing downlink packets.
  *
- * Downlink:
- *   Query: 0-poll.<sid>.<pollSeq>.<rand>.s<ip>.<zone>.
+ *   Uplink Data: 0-<b32_labels>.s<sid>.<zone>.
  */
 class FastDnsEngine(
-    private val resolverIp: String = "105.73.34.105",
+    private val resolverIp: String = "213.160.77.162",
     private val resolverPort: Int = 53,
     private val zone: String = "dns3.marocdns.uk",
     private val subId: String = FastDnsCrypto.DEFAULT_SUB_ID,
@@ -34,7 +34,9 @@ class FastDnsEngine(
 ) {
     companion object {
         private const val TAG = "FastDnsEngine"
-        val RESOLVER_TARGETS = listOf("105.73.34.105", "105.73.34.106", "213.160.77.162")
+        // 213.160.77.162 is the authoritative FastDNS server (supports the full 27KB handshake)
+        // 105.73.34.105 and 105.73.34.106 are Inwi's carrier resolvers
+        val RESOLVER_TARGETS = listOf("213.160.77.162", "105.73.34.105", "105.73.34.106")
     }
 
     // Cryptographic keys
@@ -110,88 +112,80 @@ class FastDnsEngine(
         Log.d(TAG, "SubKey derived: ${FastDnsCrypto.bytesToHex(subKey).take(16)}...")
         Log.d(TAG, "HSKey derived: ${FastDnsCrypto.bytesToHex(hsKey).take(16)}...")
 
-        // Resolver fallback targets: carrier first (for 0 DH 4G), then authoritative direct (for Wi-Fi)
+        // Build target list with 213.160.77.162 first
         val targets = mutableListOf<String>()
-        if (resolverIp.isNotEmpty()) targets.add(resolverIp)
+        if (resolverIp.isNotEmpty() && resolverIp !in targets) targets.add(resolverIp)
         for (t in RESOLVER_TARGETS) {
             if (t !in targets) targets.add(t)
         }
 
-        var connected = false
+        var handshakeOk = false
         var activeTarget = ""
+
         for (target in targets) {
             if (!running.get()) return
             onStatusChange?.invoke("Connecting to $target:$resolverPort...")
             Log.i(TAG, "Attempting connection to $target:$resolverPort")
 
             try {
+                // Clean up any previous sockets
+                try { dataSocket?.close() } catch (_: Exception) {}
+                try { pollSocket?.close() } catch (_: Exception) {}
+
                 // Data socket
                 val ds = Socket()
-                ds.soTimeout = 10000
-                ds.connect(InetSocketAddress(target, resolverPort), 5000)
+                ds.soTimeout = 12000
+                ds.connect(InetSocketAddress(target, resolverPort), 6000)
                 dataSocket = ds
                 dataOut = BufferedOutputStream(ds.getOutputStream())
                 dataIn = BufferedInputStream(ds.getInputStream())
 
                 // Poll socket
                 val ps = Socket()
-                ps.soTimeout = 10000
-                ps.connect(InetSocketAddress(target, resolverPort), 5000)
+                ps.soTimeout = 12000
+                ps.connect(InetSocketAddress(target, resolverPort), 6000)
                 pollSocket = ps
                 pollOut = BufferedOutputStream(ps.getOutputStream())
                 pollIn = BufferedInputStream(ps.getInputStream())
 
-                activeTarget = target
-                connected = true
-                Log.i(TAG, "Connected successfully to $target:$resolverPort")
-                break
+                onStatusChange?.invoke("Sending Handshake to $target...")
+                Log.i(TAG, "Connected to $target. Performing handshake...")
+
+                if (performHandshake()) {
+                    handshakeOk = true
+                    activeTarget = target
+                    Log.i(TAG, "FastDNS handshake succeeded with $target!")
+                    break
+                } else {
+                    Log.w(TAG, "Handshake failed on $target, trying next target...")
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "Connection to $target failed: ${e.message}")
-                try { dataSocket?.close() } catch (_: Exception) {}
-                try { pollSocket?.close() } catch (_: Exception) {}
-                dataSocket = null
-                pollSocket = null
+                Log.w(TAG, "Connection/Handshake error on $target: ${e.message}")
             }
         }
 
-        if (!connected) {
-            onError?.invoke("Could not reach any DNS server")
-            disconnect()
-            return
-        }
-
-        // Send FastDNS Handshake Query
-        onStatusChange?.invoke("Sending FastDNS Handshake...")
-        try {
-            val handshakeOk = performHandshake()
-            if (!handshakeOk) {
-                onError?.invoke("Handshake rejected by FastDNS server")
-                disconnect()
-                return
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Handshake error", e)
-            onError?.invoke("Handshake error: ${e.message}")
+        if (!handshakeOk) {
+            onError?.invoke("Could not complete FastDNS handshake on any server")
             disconnect()
             return
         }
 
         isConnected.set(true)
         onStatusChange?.invoke("FastDNS Connected ✓ (IP: $assignedIp)")
-        Log.i(TAG, "FastDNS tunnel is ACTIVE. Assigned IP: $assignedIp, Session: $sessionHex")
+        Log.i(TAG, "FastDNS tunnel is ACTIVE via $activeTarget. Assigned IP: $assignedIp, Session: $sessionHex")
 
         // Start downlink poll loop
         Thread(Runnable { pollLoop() }, "FastDNS-Poll").start()
     }
 
     /**
-     * Performs the real FastDNS handshake reverse-engineered from the protocol.
-     * Query: 0-handshake-batch-lz4.<subId>.<installId>.0.110.<certPart1>.<certPart2>.<zone>.
+     * Performs the real FastDNS handshake reverse-engineered from FaizVPN.
+     * Query: 0-handshake-batch-zstd.<subId>.<installId>.0.110.<certPart1>.<certPart2>.<zone>.
      */
     private fun performHandshake(): Boolean {
         val certPart1 = FastDnsCrypto.CERT_HEX.substring(0, 32)
         val certPart2 = FastDnsCrypto.CERT_HEX.substring(32)
-        val qname = "0-handshake-batch-lz4.$subId.$installId.0.110.$certPart1.$certPart2.$zone"
+        val qname = "0-handshake-batch-zstd.$subId.$installId.0.110.$certPart1.$certPart2.$zone"
 
         Log.d(TAG, "Sending handshake query: $qname")
 
@@ -201,7 +195,7 @@ class FastDnsEngine(
             return false
         }
 
-        Log.d(TAG, "Handshake raw response len: ${response.size}, first byte: ${if (response.isNotEmpty()) String.format("0x%02X", response[0]) else "empty"}")
+        Log.d(TAG, "Handshake response len: ${response.size}, first byte: 0x${String.format("%02X", response[0])}")
 
         // FastDNS handshake payload starts with 0xF1
         if (response.size > 29 && (response[0].toInt() and 0xFF) == 0xF1) {
@@ -210,27 +204,23 @@ class FastDnsEngine(
                 val ciphertextAndTag = response.copyOfRange(13, response.size)
                 val plainBytes = FastDnsCrypto.aesGcmDecrypt(hsKey, iv, ciphertextAndTag)
                 val jsonStr = String(plainBytes, Charsets.UTF_8)
-                Log.i(TAG, "Handshake decrypted successfully! JSON: $jsonStr")
+                Log.i(TAG, "Handshake decrypted! JSON: $jsonStr")
 
                 val json = JSONObject(jsonStr)
-                assignedIp = json.optString("ip", "10.8.0.2")
+                assignedIp = json.optString("ip", "10.8.153.209")
                 sessionHex = json.optString("sid", "")
 
                 if (sessionHex.isNotEmpty()) {
                     sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
-                    Log.i(TAG, "Session key derived for sid=$sessionHex, assignedIp=$assignedIp")
+                    Log.i(TAG, "SessionKey derived for sid=$sessionHex, assignedIp=$assignedIp")
                     return true
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to decrypt handshake response: ${e.message}", e)
             }
-        } else {
-            Log.w(TAG, "Handshake response format unexpected (size=${response.size})")
         }
 
-        // Fallback: If server responded with a non-0xF1 payload, check if session is accepted
-        if (assignedIp.isEmpty()) assignedIp = "10.8.0.2"
-        return assignedIp.isNotEmpty()
+        return false
     }
 
     /**
@@ -277,17 +267,26 @@ class FastDnsEngine(
 
     /**
      * Downlink polling loop.
-     * Query: 0-poll.<sid>.<pollSeq>.<rand>.s<ip>.<zone>.
+     * Query: 0-poll.<shortSess>.<pollSeq>.<rand>.s<ip>.<zone>.
      */
     private fun pollLoop() {
-        Log.i(TAG, "Poll loop running for sid=$sessionHex, ip=$assignedIp")
+        // shortSess is the decimal integer from first 4 hex chars of sid (e.g. 0x3bd6 -> 15318)
+        val shortSess = if (sessionHex.length >= 4) {
+            try {
+                Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
+            } catch (e: Exception) {
+                "39928"
+            }
+        } else "39928"
+
+        Log.i(TAG, "Poll loop running: shortSess=$shortSess, sid=$sessionHex, ip=$assignedIp")
 
         while (running.get() && isConnected.get()) {
             try {
                 val pSeq = pollSeq.getAndIncrement()
                 val rand = (100000..999999).random()
 
-                val qname = "0-poll.$sessionHex.$pSeq.$rand.s$assignedIp.$zone"
+                val qname = "0-poll.$shortSess.$pSeq.$rand.s$assignedIp.$zone"
 
                 val response = synchronized(pollOut!!) {
                     sendDnsQuery(pollOut!!, pollIn!!, qname)
