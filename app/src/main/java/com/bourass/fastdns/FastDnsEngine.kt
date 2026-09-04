@@ -234,15 +234,14 @@ class FastDnsEngine(
 
                 val qname = "0-poll.$shortSess.$pSeq.$rand.s$assignedIp.$zone"
 
-                var response: ByteArray? = null
-                synchronized(socketLock) {
+                val resp = synchronized(socketLock) {
                     if (ensureConnected() && socketOut != null && socketIn != null) {
-                        response = sendDnsQuery(socketOut!!, socketIn!!, qname)
-                    }
+                        sendDnsQuery(socketOut!!, socketIn!!, qname)
+                    } else null
                 }
 
-                if (response != null && response.isNotEmpty()) {
-                    processDownlink(response!!)
+                if (resp != null && resp.isNotEmpty()) {
+                    processDownlink(resp)
                 }
 
                 Thread.sleep(80)
