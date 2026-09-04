@@ -131,9 +131,8 @@ class FastDnsVpnService : VpnService() {
             return
         }
 
-        // 3. Protect the engine's sockets from being routed through VPN
-        eng.getDataSocket()?.let { protect(it) }
-        eng.getPollSocket()?.let { protect(it) }
+        // 3. Protect the engine's socket from being routed through VPN
+        eng.getSocket()?.let { protect(it) }
 
         // 4. Create the TUN interface
         val assignedIp = eng.assignedIp.ifEmpty { "10.8.0.2" }
