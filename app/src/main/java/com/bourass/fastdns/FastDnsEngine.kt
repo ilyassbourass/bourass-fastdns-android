@@ -159,18 +159,17 @@ class FastDnsEngine(
             return
         }
 
-        // Send handshake
-        onStatusChange?.invoke("Performing FastDNS handshake...")
-        try {
-            val handshakeOk = performHandshake()
-            if (!handshakeOk) {
-                onError?.invoke("Handshake failed — no response from server")
-                disconnect()
-                return
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Handshake error", e)
-            onError?.invoke("Handshake error: ${e.message}")
+        // Verify FastDNS tunnel with initial poll query
+        onStatusChange?.invoke("Verifying FastDNS tunnel...")
+        assignedIp = "10.8.0.2"
+        val testPoll = buildPollQueryName(0, (10000..99999).random())
+        Log.d(TAG, "Initial test query: $testPoll")
+
+        val response = sendDnsQuery(pollOut!!, pollIn!!, testPoll)
+        Log.d(TAG, "Initial poll response: len=${response?.size} hex=${response?.let { FastDnsCrypto.bytesToHex(it) }} text=${response?.let { String(it, Charsets.UTF_8) }}")
+
+        if (response == null || response.isEmpty()) {
+            onError?.invoke("No response from FastDNS server")
             disconnect()
             return
         }
@@ -183,89 +182,6 @@ class FastDnsEngine(
     }
 
     /**
-     * Performs the initial FastDNS handshake.
-     * Sends an encrypted "hello" via DNS query and parses the server's response
-     * to obtain the assigned tunnel IP address.
-     */
-    private fun performHandshake(): Boolean {
-        // Build handshake payload: installId + subId marker
-        val hsPayload = buildHandshakePayload()
-
-        // Encrypt with handshake key
-        val nonce = ByteArray(12)
-        SecureRandom().nextBytes(nonce)
-        val encrypted = FastDnsCrypto.aesGcmEncrypt(hsKey, nonce, hsPayload)
-
-        // Frame: [nonce (12)] [encrypted+tag]
-        val frame = nonce + encrypted
-
-        // Encode as Base32 and send as DNS query
-        val b32 = FastDnsCrypto.base32Encode(frame)
-        val qname = buildDataQueryName(b32)
-
-        Log.d(TAG, "Handshake query: ${qname.take(80)}...")
-
-        val response = sendDnsQuery(dataOut!!, dataIn!!, qname)
-        Log.d(TAG, "Handshake response: len=${response?.size} hex=${response?.let { FastDnsCrypto.bytesToHex(it) }} text=${response?.let { String(it, Charsets.UTF_8) }}")
-
-        if (response != null && response.isNotEmpty()) {
-            // Try to parse response
-            try {
-                val parsed = parseHandshakeResponse(response)
-                if (parsed != null) {
-                    assignedIp = parsed
-                    Log.i(TAG, "Assigned tunnel IP: $assignedIp")
-                    return true
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Handshake response parse error: ${e.message}")
-            }
-            // Even if we can't parse the IP, if we got a response, the session is alive
-            if (assignedIp.isEmpty()) assignedIp = "10.8.0.2"
-            return true
-        }
-
-        return false
-    }
-
-    private fun buildHandshakePayload(): ByteArray {
-        // The handshake payload includes identity markers
-        val buf = ByteBuffer.allocate(256)
-        buf.put(installId.toByteArray(Charsets.UTF_8))
-        buf.put(0x00)
-        buf.put(subId.toByteArray(Charsets.UTF_8))
-        buf.put(0x00)
-        buf.put(FastDnsCrypto.CERT_HEX.toByteArray(Charsets.UTF_8))
-        buf.flip()
-        val result = ByteArray(buf.remaining())
-        buf.get(result)
-        return result
-    }
-
-    private fun parseHandshakeResponse(data: ByteArray): String? {
-        // Server may respond with assigned IP in various formats
-        // Try to find IPv4 pattern in response
-        val text = String(data, Charsets.UTF_8)
-        val ipPattern = Regex("""(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})""")
-        val match = ipPattern.find(text)
-        if (match != null) return match.groupValues[1]
-
-        // If encrypted, try decrypting with session key
-        if (data.size > 28) { // 12 nonce + 16 tag minimum
-            try {
-                val nonce = data.copyOfRange(0, 12)
-                val ct = data.copyOfRange(12, data.size)
-                val plain = FastDnsCrypto.aesGcmDecrypt(sessionKey!!, nonce, ct)
-                val plainText = String(plain, Charsets.UTF_8)
-                val ipMatch = ipPattern.find(plainText)
-                if (ipMatch != null) return ipMatch.groupValues[1]
-            } catch (_: Exception) {}
-        }
-
-        return null
-    }
-
-    /**
      * Send uplink data through the FastDNS tunnel.
      * Data is encrypted, Base32-encoded, and sent as DNS NULL queries.
      */
@@ -273,35 +189,45 @@ class FastDnsEngine(
         if (!isConnected.get() || dataOut == null) return
 
         try {
-            val seq = uplinkSeq.getAndIncrement()
-
-            // Build frame: [seq u16 BE] [streamId u8] [data]
-            val frame = ByteBuffer.allocate(3 + data.size)
-            frame.putShort(seq.toShort())
-            frame.put(0x01) // stream ID
-            frame.put(data)
-            frame.flip()
-            val frameBytes = ByteArray(frame.remaining())
-            frame.get(frameBytes)
-
-            // Encrypt
-            val nonce = ByteArray(12)
-            SecureRandom().nextBytes(nonce)
-            val encrypted = FastDnsCrypto.aesGcmEncrypt(sessionKey!!, nonce, frameBytes)
-            val payload = nonce + encrypted
-
-            // Base32 encode
-            val b32 = FastDnsCrypto.base32Encode(payload)
-            val qname = buildDataQueryName(b32)
-
-            // Send query (don't wait for meaningful response on data channel)
-            synchronized(dataOut!!) {
-                sendDnsQueryNoWait(dataOut!!, qname)
+            val maxChunk = 80
+            var offset = 0
+            while (offset < data.size) {
+                val end = minOf(offset + maxChunk, data.size)
+                val chunk = data.copyOfRange(offset, end)
+                sendSingleChunk(chunk)
+                offset = end
             }
-
             bytesSent.addAndGet(data.size.toLong())
         } catch (e: Exception) {
             Log.e(TAG, "Uplink error", e)
+        }
+    }
+
+    private fun sendSingleChunk(chunk: ByteArray) {
+        val seq = uplinkSeq.getAndIncrement()
+
+        // Build frame: [seq u16 BE] [streamId u8] [chunk]
+        val frame = ByteBuffer.allocate(3 + chunk.size)
+        frame.putShort(seq.toShort())
+        frame.put(0x01) // stream ID
+        frame.put(chunk)
+        frame.flip()
+        val frameBytes = ByteArray(frame.remaining())
+        frame.get(frameBytes)
+
+        // Encrypt
+        val nonce = ByteArray(12)
+        SecureRandom().nextBytes(nonce)
+        val encrypted = FastDnsCrypto.aesGcmEncrypt(sessionKey!!, nonce, frameBytes)
+        val payload = nonce + encrypted
+
+        // Base32 encode
+        val b32 = FastDnsCrypto.base32Encode(payload)
+        val qname = buildDataQueryName(b32)
+
+        // Send query (don't wait for meaningful response on data channel)
+        synchronized(dataOut!!) {
+            sendDnsQueryNoWait(dataOut!!, qname)
         }
     }
 
