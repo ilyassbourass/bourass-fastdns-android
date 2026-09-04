@@ -23,32 +23,41 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Create Gradle Wrapper
+      - name: Generate Gradle Wrapper
         run: |
-          gradle wrapper --gradle-version 8.3
+          mkdir -p gradle/wrapper
+          # Download the gradle-wrapper.jar directly
+          curl -sL https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar -o gradle/wrapper/gradle-wrapper.jar
+          # Create gradlew script
+          cat > gradlew << 'SCRIPT'
+          #!/bin/sh
+          exec java -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" "$@"
+          SCRIPT
+          # Actually use a proper gradlew
+          curl -sL https://raw.githubusercontent.com/nicolestandifer3/Simple-Compose-App/main/gradlew -o gradlew || true
+          chmod +x gradlew
+          # If curl failed, create a simple wrapper
+          if [ ! -s gradlew ]; then
+            echo '#!/bin/sh' > gradlew
+            echo 'DIRNAME=$(dirname "$0")' >> gradlew
+            echo 'exec java -classpath "$DIRNAME/gradle/wrapper/gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain "$@"' >> gradlew
+            chmod +x gradlew
+          fi
+
+      - name: Download Gradle Wrapper JAR
+        run: |
+          # Use gradle init to generate proper wrapper
+          gradle wrapper --gradle-version 8.9 --no-build-cache --no-configuration-cache 2>/dev/null || true
+          # Verify wrapper exists
+          ls -la gradle/wrapper/
+          chmod +x gradlew
 
       - name: Build Debug APK
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --stacktrace --no-configuration-cache
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: BourassFastDNS-debug
           path: app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Build Release APK (unsigned)
-        run: |
-          ./gradlew assembleRelease --stacktrace
-        continue-on-error: true
-
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: BourassFastDNS-release
-          path: app/build/outputs/apk/release/
-        if: success() || failure()
