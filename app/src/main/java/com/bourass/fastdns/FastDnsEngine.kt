@@ -201,18 +201,12 @@ class FastDnsEngine(
 
         // Encode as Base32 and send as DNS query
         val b32 = FastDnsCrypto.base32Encode(frame)
-        val labels = FastDnsCrypto.splitIntoLabels(b32, 63)
-
-        // Build query name: 0-<label1>.<label2>...<labelN>.s<sessionHex>.<zone>
-        val qnameParts = mutableListOf("0")
-        qnameParts.addAll(labels)
-        qnameParts.add("s$sessionHex")
-        qnameParts.add(zone)
-        val qname = qnameParts.joinToString(".")
+        val qname = buildDataQueryName(b32)
 
         Log.d(TAG, "Handshake query: ${qname.take(80)}...")
 
         val response = sendDnsQuery(dataOut!!, dataIn!!, qname)
+        Log.d(TAG, "Handshake response: len=${response?.size} hex=${response?.let { FastDnsCrypto.bytesToHex(it) }} text=${response?.let { String(it, Charsets.UTF_8) }}")
 
         if (response != null && response.isNotEmpty()) {
             // Try to parse response
@@ -298,14 +292,7 @@ class FastDnsEngine(
 
             // Base32 encode
             val b32 = FastDnsCrypto.base32Encode(payload)
-            val labels = FastDnsCrypto.splitIntoLabels(b32, 63)
-
-            // Build uplink query name
-            val qnameParts = mutableListOf("0")
-            qnameParts.addAll(labels)
-            qnameParts.add("s$sessionHex")
-            qnameParts.add(zone)
-            val qname = qnameParts.joinToString(".")
+            val qname = buildDataQueryName(b32)
 
             // Send query (don't wait for meaningful response on data channel)
             synchronized(dataOut!!) {
@@ -319,6 +306,40 @@ class FastDnsEngine(
     }
 
     /**
+     * Build data/uplink QNAME: 0-<chunk0>.<chunk1>...<chunkN>.s<sessionHex>.<zone>
+     */
+    private fun buildDataQueryName(b32: String): String {
+        val firstLen = minOf(61, b32.length)
+        val firstLabel = "0-" + b32.substring(0, firstLen)
+        val labels = mutableListOf(firstLabel)
+        var i = firstLen
+        while (i < b32.length) {
+            val end = minOf(i + 63, b32.length)
+            labels.add(b32.substring(i, end))
+            i = end
+        }
+        labels.add("s$sessionHex")
+        labels.add(zone)
+        return labels.joinToString(".")
+    }
+
+    /**
+     * Build poll QNAME: 0-poll.<shortSession>.0.<rand>.s<ip_octets>.<zone>
+     * Wire format matching live pcap:
+     * e.g. 0-poll.39928.0.88066.s10.8.135.170.dns3.marocdns.uk
+     */
+    private fun buildPollQueryName(seq: Int, rand: Int): String {
+        val ipParts = assignedIp.split(".")
+        val sIp = if (ipParts.size == 4) {
+            "s${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.${ipParts[3]}"
+        } else {
+            "s10.8.0.2"
+        }
+        val shortSess = (sessionHex.take(4).toIntOrNull(16) ?: (10000..65535).random()).toString()
+        return "0-poll.$shortSess.0.$rand.$sIp.$zone"
+    }
+
+    /**
      * Poll loop: continuously sends poll queries and processes downlink data.
      */
     private fun pollLoop() {
@@ -327,11 +348,9 @@ class FastDnsEngine(
         while (running.get() && isConnected.get()) {
             try {
                 val pSeq = pollSeq.getAndIncrement()
-                val rand = (1000..9999).random()
+                val rand = (10000..999999).random()
 
-                // Build poll query: 0-poll.<sessionHex>.<pollSeq>.<rand>.s<ipOctets>.<zone>
-                val ipOctets = assignedIp.replace(".", "")
-                val qname = "0-poll.$sessionHex.$pSeq.$rand.s$ipOctets.$zone"
+                val qname = buildPollQueryName(pSeq, rand)
 
                 val response = synchronized(pollOut!!) {
                     sendDnsQuery(pollOut!!, pollIn!!, qname)
