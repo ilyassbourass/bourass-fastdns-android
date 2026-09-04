@@ -73,7 +73,11 @@ class MainActivity : AppCompatActivity() {
     private fun startVpn() {
         val vpnIntent = Intent(this, FastDnsVpnService::class.java)
         vpnIntent.action = FastDnsVpnService.ACTION_CONNECT
-        startService(vpnIntent)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            startForegroundService(vpnIntent)
+        } else {
+            startService(vpnIntent)
+        }
         isConnected = true
         tvStatus.text = "Connecting..."
         updateUiState()

@@ -31,7 +31,8 @@ class FastDnsEngine(
 ) {
     companion object {
         private const val TAG = "FastDnsEngine"
-        val RESOLVER_TARGETS = listOf("37.221.198.37", "105.73.34.105", "105.73.34.106")
+        val RESOLVER_TARGETS = listOf("105.73.34.105", "105.73.34.106", "37.221.198.37", "213.160.77.162")
+        val ZONES = listOf("dns.marocdns.uk", "dns3.marocdns.uk")
         private const val CHUNK_LIMIT = 81
     }
 
@@ -113,7 +114,7 @@ class FastDnsEngine(
     }
 
     /**
-     * Sends the 0-handshake-batch-zstd query across accounts in the pool.
+     * Sends the 0-handshake-batch-zstd query across accounts and zones in the pool.
      */
     private fun performHandshake(): Boolean {
         val cert = FastDnsCrypto.CERT_HEX
@@ -126,58 +127,61 @@ class FastDnsEngine(
             val currentSubKey = FastDnsCrypto.deriveSubKey(currentSub)
             val currentHsKey = FastDnsCrypto.deriveHandshakeKey(currentSubKey, currentInst)
 
-            val qname = "0-handshake-batch-zstd.$currentSub.$currentInst.0.110.${cert.substring(0, 32)}.${cert.substring(32)}.$zone."
-            Log.i(TAG, "Attempting handshake with subId=$currentSub, qname=$qname")
+            for (targetZone in ZONES) {
+                val qname = "0-handshake-batch-zstd.$currentSub.$currentInst.0.110.${cert.substring(0, 32)}.${cert.substring(32)}.$targetZone."
+                Log.i(TAG, "Attempting handshake with subId=$currentSub, zone=$targetZone")
 
-            for (target in RESOLVER_TARGETS) {
-                try {
-                    Log.i(TAG, "Attempting handshake with $target:$resolverPort")
-                    val s = Socket()
-                    s.tcpNoDelay = true
-                    s.soTimeout = 6000
-                    vpnService.protect(s)
-                    s.connect(InetSocketAddress(target, resolverPort), 4000)
+                for (target in RESOLVER_TARGETS) {
+                    try {
+                        val s = Socket()
+                        s.tcpNoDelay = true
+                        s.soTimeout = 8000
+                        vpnService.protect(s)
+                        s.connect(InetSocketAddress(target, resolverPort), 5000)
 
-                    val out = BufferedOutputStream(s.getOutputStream(), 4096)
-                    val inp = BufferedInputStream(s.getInputStream(), 65536)
+                        val out = DataOutputStream(s.getOutputStream())
+                        val inp = DataInputStream(s.getInputStream())
 
-                    val resp = sendDnsQuery(out, inp, qname)
-                    try { s.close() } catch (_: Exception) {}
+                        val resp = sendDnsQuery(out, inp, qname)
+                        try { s.close() } catch (_: Exception) {}
 
-                    if (resp != null && resp.size > 29 && (resp[0].toInt() and 0xFF) == 0xF1) {
-                        val nonce = resp.copyOfRange(1, 13)
-                        val ciphertext = resp.copyOfRange(13, resp.size)
-                        val plain = FastDnsCrypto.aesGcmDecrypt(currentHsKey, nonce, ciphertext)
-                        val jsonStr = String(plain, Charsets.UTF_8)
-                        Log.i(TAG, "Handshake decrypted: $jsonStr")
+                        if (resp != null && resp.size > 29 && (resp[0].toInt() and 0xFF) == 0xF1) {
+                            val nonce = resp.copyOfRange(1, 13)
+                            val ciphertext = resp.copyOfRange(13, resp.size)
+                            val plain = FastDnsCrypto.aesGcmDecrypt(currentHsKey, nonce, ciphertext)
+                            val jsonStr = String(plain, Charsets.UTF_8)
+                            Log.i(TAG, "Handshake decrypted: $jsonStr")
 
-                        val json = JSONObject(jsonStr)
-                        sessionHex = json.getString("sid")
-                        assignedIp = json.getString("ip")
-                        shortSess = if (sessionHex.length >= 4) {
-                            try {
-                                Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
-                            } catch (_: Exception) {
+                            val json = JSONObject(jsonStr)
+                            sessionHex = json.getString("sid")
+                            assignedIp = json.getString("ip")
+                            shortSess = if (sessionHex.length >= 4) {
+                                try {
+                                    Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
+                                } catch (_: Exception) {
+                                    "39928"
+                                }
+                            } else {
                                 "39928"
                             }
+
+                            subId = currentSub
+                            installId = currentInst
+                            subKey = currentSubKey
+                            hsKey = currentHsKey
+                            zone = targetZone
+                            sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
+                            poolIndex = (idx + 1) % accountPool.size
+
+                            Log.i(TAG, "Session ready! subId=$subId, sid=$sessionHex, ip=$assignedIp, zone=$zone")
+                            return true
                         } else {
-                            "39928"
+                            val text = resp?.let { String(it, Charsets.UTF_8) } ?: "null"
+                            Log.w(TAG, "Handshake resp from $target ($currentSub, $targetZone): $text (len=${resp?.size})")
                         }
-
-                        subId = currentSub
-                        installId = currentInst
-                        subKey = currentSubKey
-                        hsKey = currentHsKey
-                        sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
-                        poolIndex = (idx + 1) % accountPool.size
-
-                        Log.i(TAG, "Session ready! subId=$subId, sid=$sessionHex, ip=$assignedIp, shortSess=$shortSess")
-                        return true
-                    } else {
-                        Log.w(TAG, "Handshake resp invalid from $target for $currentSub: len=${resp?.size}")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Handshake attempt with $target ($currentSub, $targetZone) failed: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Handshake attempt with $target ($currentSub) failed: ${e.message}")
                 }
             }
         }
@@ -198,8 +202,8 @@ class FastDnsEngine(
     private fun uplinkLoop() {
         Log.i(TAG, "Uplink worker started")
         var socket: Socket? = null
-        var out: OutputStream? = null
-        var inp: InputStream? = null
+        var out: DataOutputStream? = null
+        var inp: DataInputStream? = null
         var targetIdx = 0
 
         fun connectSocket(): Boolean {
@@ -218,8 +222,8 @@ class FastDnsEngine(
                     vpnService.protect(s)
                     s.connect(InetSocketAddress(target, resolverPort), 5000)
                     socket = s
-                    out = BufferedOutputStream(s.getOutputStream(), 16384)
-                    inp = BufferedInputStream(s.getInputStream(), 4096)
+                    out = DataOutputStream(s.getOutputStream())
+                    inp = DataInputStream(s.getInputStream())
                     targetIdx = idx
                     Log.i(TAG, "Uplink socket connected to $target:$resolverPort")
                     return true
@@ -260,7 +264,7 @@ class FastDnsEngine(
      * Synchronously sends one uplink IP packet with batch framing, Zstd compression,
      * and multi-chunk AES-GCM encryption matching the wire protocol.
      */
-    private fun sendUplinkSync(data: ByteArray, out: OutputStream, inp: InputStream) {
+    private fun sendUplinkSync(data: ByteArray, out: DataOutputStream, inp: DataInputStream) {
         val sk = sessionKey ?: return
         val seq = uplinkSeq.getAndIncrement() and 0xFFFF
 
@@ -315,8 +319,8 @@ class FastDnsEngine(
     private fun pollLoop() {
         Log.i(TAG, "Poll worker started for shortSess=$shortSess, ip=$assignedIp")
         var socket: Socket? = null
-        var out: OutputStream? = null
-        var inp: InputStream? = null
+        var out: DataOutputStream? = null
+        var inp: DataInputStream? = null
         var targetIdx = 0
 
         fun connectSocket(): Boolean {
@@ -335,8 +339,8 @@ class FastDnsEngine(
                     vpnService.protect(s)
                     s.connect(InetSocketAddress(target, resolverPort), 5000)
                     socket = s
-                    out = BufferedOutputStream(s.getOutputStream(), 16384)
-                    inp = BufferedInputStream(s.getInputStream(), 32768)
+                    out = DataOutputStream(s.getOutputStream())
+                    inp = DataInputStream(s.getInputStream())
                     targetIdx = idx
                     Log.i(TAG, "Poll socket connected to $target:$resolverPort")
                     return true
@@ -504,14 +508,11 @@ class FastDnsEngine(
 
     // ---- DNS Wire Protocol Helpers ----
 
-    private fun sendDnsQuery(out: OutputStream, inp: InputStream, qname: String): ByteArray? {
+    private fun sendDnsQuery(out: DataOutputStream, inp: DataInputStream, qname: String): ByteArray? {
         val txId = (0..0xFFFF).random()
         val packet = buildDnsPacket(txId, qname)
 
-        val lenBuf = ByteBuffer.allocate(2)
-        lenBuf.putShort(packet.size.toShort())
-
-        out.write(lenBuf.array())
+        out.writeShort(packet.size)
         out.write(packet)
         out.flush()
 
@@ -541,23 +542,19 @@ class FastDnsEngine(
         return buf.toByteArray()
     }
 
-    private fun readDnsResponse(inp: InputStream): ByteArray? {
-        val lenBytes = ByteArray(2)
-        var read = 0
-        while (read < 2) {
-            val r = inp.read(lenBytes, read, 2 - read)
-            if (r <= 0) return null
-            read += r
+    private fun readDnsResponse(inp: DataInputStream): ByteArray? {
+        val responseLen = try {
+            inp.readUnsignedShort()
+        } catch (_: Exception) {
+            return null
         }
-        val responseLen = ((lenBytes[0].toInt() and 0xFF) shl 8) or (lenBytes[1].toInt() and 0xFF)
         if (responseLen < 12 || responseLen > 65535) return null
 
         val response = ByteArray(responseLen)
-        read = 0
-        while (read < responseLen) {
-            val r = inp.read(response, read, responseLen - read)
-            if (r <= 0) return null
-            read += r
+        try {
+            inp.readFully(response)
+        } catch (_: Exception) {
+            return null
         }
 
         return extractRdata(response)
