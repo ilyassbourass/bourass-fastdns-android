@@ -8,9 +8,70 @@ import javax.crypto.spec.SecretKeySpec
 object FastDnsCrypto {
     // Extracted Master Key from libfvpnkeys.so NativeKeys.masterKey()
     const val MASTER_KEY_HEX = "3529de18502ac35a534ce8b541d834228ca3c1cd89b6ce3d31cf44072f0e477a"
-    const val DEFAULT_SUB_ID = "4db6aa8190671ed0"
-    const val DEFAULT_INSTALL_ID = "73f7f016233cf06ab0eeeea89e0ec50c"
+    const val DEFAULT_SUB_ID = "1122334455667788"
+    const val DEFAULT_ZONE = "dns.marocdns.uk"
+    const val DEFAULT_TARGET_IP = "37.221.198.37"
+    const val APP_CERT_SHA256 = "018f8bcd84ff15310d78e48257278e54c676a2732afe6cf89672a3ca841f6054"
     const val CERT_HEX = "c39a8841ecb915f1ba6462f486ee009219b052db290f5209f53d34c31c56ab41"
+
+    val INITIAL_POOL = listOf(
+        "1122334455667788",
+        "d6ec7d72c0bdf860",
+        "23d5e6fa2198b0bd",
+        "bf3e0703a7095d41",
+        "4ad9663fa2800dcf",
+        "c34f930d89fbd396",
+        "5d1793e49ea04d42",
+        "2503e1acb9104230",
+        "a52257518f759fbe",
+        "8c3987d0c84539eb",
+        "1db28923c5e6fe6c",
+        "551c6a71203d2e7c",
+        "2d1f737e8df3f7c8",
+        "b15b622070e682a9",
+        "b891c44f58a09268",
+        "7e640b1f82cf50fb",
+        "c9cd858456937ebd",
+        "3472b6e3e7914aef",
+        "7493d7fab1c1d5b4"
+    )
+
+    fun deriveInstallId(subId: String): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(("fv-install-bind-v1:$subId").toByteArray(Charsets.UTF_8))
+        return bytesToHex(digest).substring(0, 32)
+    }
+
+    fun provisionAccount(hwid: String): Boolean {
+        return try {
+            val ts = (System.currentTimeMillis() / 1000).toString()
+            val subKey = deriveSubKey(hwid)
+            val msg = "chk1$hwid|$ts".toByteArray(Charsets.UTF_8)
+            val sign = bytesToHex(hmacSha256(subKey, msg)).lowercase()
+            val installId = deriveInstallId(hwid)
+
+            val url = java.net.URL("https://panel.marocdns.uk/api/app/config-check")
+            val conn = url.openConnection() as javax.net.ssl.HttpsURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.setRequestProperty("X-Hwid", hwid)
+            conn.setRequestProperty("X-Ts", ts)
+            conn.setRequestProperty("X-Sign", sign)
+            conn.setRequestProperty("X-Vpn-Connected", "0")
+            conn.setRequestProperty("X-App-Vc", "110")
+            conn.setRequestProperty("X-App-Vn", "1.11.0")
+            conn.setRequestProperty("X-App-Cert", APP_CERT_SHA256)
+            conn.setRequestProperty("X-Install-Id", installId)
+            conn.setRequestProperty("User-Agent", "okhttp/4.12.0")
+
+            val code = conn.responseCode
+            conn.disconnect()
+            code == 200
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     fun hexToBytes(hex: String): ByteArray {
         val len = hex.length

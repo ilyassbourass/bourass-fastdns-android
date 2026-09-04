@@ -32,7 +32,7 @@ class MainActivity : AppCompatActivity() {
         btnConnect = findViewById(R.id.btnConnect)
         btnDisconnect = findViewById(R.id.btnDisconnect)
 
-        tvServer.text = "DNS Server: 105.73.34.105:53\nZone: dns3.marocdns.uk"
+        tvServer.text = "DNS Server: 37.221.198.37:53 (Tunnel 1)\nZone: dns.marocdns.uk"
 
         btnConnect.setOnClickListener {
             val intent = VpnService.prepare(this)

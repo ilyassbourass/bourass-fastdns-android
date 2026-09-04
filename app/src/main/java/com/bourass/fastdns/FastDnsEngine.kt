@@ -25,14 +25,19 @@ import java.util.concurrent.atomic.AtomicLong
 class FastDnsEngine(
     private val vpnService: VpnService,
     private val resolverPort: Int = 53,
-    private val zone: String = "dns3.marocdns.uk",
-    private val subId: String = FastDnsCrypto.DEFAULT_SUB_ID,
-    private val installId: String = FastDnsCrypto.DEFAULT_INSTALL_ID
+    private var zone: String = FastDnsCrypto.DEFAULT_ZONE,
+    private var subId: String = FastDnsCrypto.DEFAULT_SUB_ID,
+    private var installId: String = FastDnsCrypto.deriveInstallId(FastDnsCrypto.DEFAULT_SUB_ID)
 ) {
     companion object {
         private const val TAG = "FastDnsEngine"
-        val RESOLVER_TARGETS = listOf("213.160.77.162", "105.73.34.106", "105.73.34.105")
+        val RESOLVER_TARGETS = listOf("37.221.198.37", "105.73.34.105", "105.73.34.106")
+        private const val CHUNK_LIMIT = 81
     }
+
+    // Dynamic Account Pool
+    private val accountPool = java.util.concurrent.CopyOnWriteArrayList<String>(FastDnsCrypto.INITIAL_POOL)
+    private var poolIndex = 0
 
     // Cryptographic keys
     private lateinit var subKey: ByteArray
@@ -64,6 +69,7 @@ class FastDnsEngine(
     var onError: ((String) -> Unit)? = null
 
     private val running = AtomicBoolean(false)
+    private val rotating = AtomicBoolean(false)
 
     fun connect() {
         if (isConnected.get()) return
@@ -88,12 +94,6 @@ class FastDnsEngine(
     }
 
     private fun performConnect() {
-        onStatusChange?.invoke("Deriving cryptographic keys...")
-
-        subKey = FastDnsCrypto.deriveSubKey(subId)
-        hsKey = FastDnsCrypto.deriveHandshakeKey(subKey, installId)
-
-        // 1. Perform handshake with server to obtain real session and IP
         onStatusChange?.invoke("Connecting to FastDNS server...")
         val handshakeOk = performHandshake()
         if (!handshakeOk) {
@@ -106,62 +106,79 @@ class FastDnsEngine(
         onStatusChange?.invoke("FastDNS Connected ✓ ($assignedIp)")
         Log.i(TAG, "FastDNS tunnel is ACTIVE with sid=$sessionHex, ip=$assignedIp")
 
-        // 2. Start downlink poll loop and uplink worker
+        // Start downlink poll loop, uplink worker, and background replenishment
         Thread(Runnable { pollLoop() }, "FastDNS-Poll").start()
         Thread(Runnable { uplinkLoop() }, "FastDNS-Uplink").start()
+        startBackgroundReplenishment()
     }
 
     /**
-     * Sends the 0-handshake-batch-zstd query to discover session parameters.
+     * Sends the 0-handshake-batch-zstd query across accounts in the pool.
      */
     private fun performHandshake(): Boolean {
         val cert = FastDnsCrypto.CERT_HEX
-        val qname = "0-handshake-batch-zstd.$subId.$installId.0.110.${cert.substring(0, 32)}.${cert.substring(32)}.$zone."
-        Log.i(TAG, "Handshake QNAME: $qname")
+        val initialIdx = poolIndex
 
-        for (target in RESOLVER_TARGETS) {
-            try {
-                Log.i(TAG, "Attempting handshake with $target:$resolverPort")
-                val s = Socket()
-                s.tcpNoDelay = true
-                s.soTimeout = 8000
-                vpnService.protect(s)
-                s.connect(InetSocketAddress(target, resolverPort), 5000)
+        for (attempt in 0 until accountPool.size) {
+            val idx = (initialIdx + attempt) % accountPool.size
+            val currentSub = accountPool[idx]
+            val currentInst = FastDnsCrypto.deriveInstallId(currentSub)
+            val currentSubKey = FastDnsCrypto.deriveSubKey(currentSub)
+            val currentHsKey = FastDnsCrypto.deriveHandshakeKey(currentSubKey, currentInst)
 
-                val out = BufferedOutputStream(s.getOutputStream(), 4096)
-                val inp = BufferedInputStream(s.getInputStream(), 65536)
+            val qname = "0-handshake-batch-zstd.$currentSub.$currentInst.0.110.${cert.substring(0, 32)}.${cert.substring(32)}.$zone."
+            Log.i(TAG, "Attempting handshake with subId=$currentSub, qname=$qname")
 
-                val resp = sendDnsQuery(out, inp, qname)
-                try { s.close() } catch (_: Exception) {}
+            for (target in RESOLVER_TARGETS) {
+                try {
+                    Log.i(TAG, "Attempting handshake with $target:$resolverPort")
+                    val s = Socket()
+                    s.tcpNoDelay = true
+                    s.soTimeout = 6000
+                    vpnService.protect(s)
+                    s.connect(InetSocketAddress(target, resolverPort), 4000)
 
-                if (resp != null && resp.size > 29 && (resp[0].toInt() and 0xFF) == 0xF1) {
-                    val nonce = resp.copyOfRange(1, 13)
-                    val ciphertext = resp.copyOfRange(13, resp.size)
-                    val plain = FastDnsCrypto.aesGcmDecrypt(hsKey, nonce, ciphertext)
-                    val jsonStr = String(plain, Charsets.UTF_8)
-                    Log.i(TAG, "Handshake decrypted: $jsonStr")
+                    val out = BufferedOutputStream(s.getOutputStream(), 4096)
+                    val inp = BufferedInputStream(s.getInputStream(), 65536)
 
-                    val json = JSONObject(jsonStr)
-                    sessionHex = json.getString("sid")
-                    assignedIp = json.getString("ip")
-                    shortSess = if (sessionHex.length >= 4) {
-                        try {
-                            Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
-                        } catch (_: Exception) {
+                    val resp = sendDnsQuery(out, inp, qname)
+                    try { s.close() } catch (_: Exception) {}
+
+                    if (resp != null && resp.size > 29 && (resp[0].toInt() and 0xFF) == 0xF1) {
+                        val nonce = resp.copyOfRange(1, 13)
+                        val ciphertext = resp.copyOfRange(13, resp.size)
+                        val plain = FastDnsCrypto.aesGcmDecrypt(currentHsKey, nonce, ciphertext)
+                        val jsonStr = String(plain, Charsets.UTF_8)
+                        Log.i(TAG, "Handshake decrypted: $jsonStr")
+
+                        val json = JSONObject(jsonStr)
+                        sessionHex = json.getString("sid")
+                        assignedIp = json.getString("ip")
+                        shortSess = if (sessionHex.length >= 4) {
+                            try {
+                                Integer.parseInt(sessionHex.substring(0, 4), 16).toString()
+                            } catch (_: Exception) {
+                                "39928"
+                            }
+                        } else {
                             "39928"
                         }
-                    } else {
-                        "39928"
-                    }
 
-                    sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
-                    Log.i(TAG, "Session ready! sid=$sessionHex, ip=$assignedIp, shortSess=$shortSess")
-                    return true
-                } else {
-                    Log.w(TAG, "Handshake resp invalid from $target: len=${resp?.size}")
+                        subId = currentSub
+                        installId = currentInst
+                        subKey = currentSubKey
+                        hsKey = currentHsKey
+                        sessionKey = FastDnsCrypto.deriveSessionKey(subKey, installId, sessionHex)
+                        poolIndex = (idx + 1) % accountPool.size
+
+                        Log.i(TAG, "Session ready! subId=$subId, sid=$sessionHex, ip=$assignedIp, shortSess=$shortSess")
+                        return true
+                    } else {
+                        Log.w(TAG, "Handshake resp invalid from $target for $currentSub: len=${resp?.size}")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Handshake attempt with $target ($currentSub) failed: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Handshake attempt with $target failed: ${e.message}")
             }
         }
         return false
@@ -240,11 +257,12 @@ class FastDnsEngine(
     }
 
     /**
-     * Synchronously sends one uplink IP packet.
+     * Synchronously sends one uplink IP packet with batch framing, Zstd compression,
+     * and multi-chunk AES-GCM encryption matching the wire protocol.
      */
     private fun sendUplinkSync(data: ByteArray, out: OutputStream, inp: InputStream) {
         val sk = sessionKey ?: return
-        val seq = uplinkSeq.getAndIncrement()
+        val seq = uplinkSeq.getAndIncrement() and 0xFFFF
 
         // Batch framing: [length u16 BE] + [packet bytes]
         val batch = ByteArray(2 + data.size)
@@ -255,25 +273,39 @@ class FastDnsEngine(
         // Zstd compress
         val compressed = zstdCompress(batch)
 
-        // AES-GCM encrypt
-        val iv = ByteArray(12)
-        SecureRandom().nextBytes(iv)
-        val encrypted = FastDnsCrypto.aesGcmEncrypt(sk, iv, compressed)
+        // Chunking across DNS limits
+        val chunkLimit = CHUNK_LIMIT
+        val totalChunks = (compressed.size + chunkLimit - 1) / chunkLimit
 
-        // Wire frame: [seq u16 BE][0x00, 0x01][0xF1][iv (12)][ciphertext]
-        val enc = byteArrayOf(0xF1.toByte()) + iv + encrypted
-        val frame = byteArrayOf((seq shr 8).toByte(), (seq and 0xFF).toByte(), 0x00, 0x01) + enc
+        for (chunkIdx in 0 until totalChunks) {
+            val start = chunkIdx * chunkLimit
+            val end = Math.min(start + chunkLimit, compressed.size)
+            val chunkData = compressed.copyOfRange(start, end)
 
-        // Base32 encode
-        val b32 = FastDnsCrypto.base32Encode(frame)
-        val firstLabel = "0-" + b32.take(61)
-        val restLabels = if (b32.length > 61) b32.substring(61).chunked(63) else emptyList()
-        val labels = listOf(firstLabel) + restLabels
+            // AES-GCM encrypt each chunk
+            val iv = ByteArray(12)
+            SecureRandom().nextBytes(iv)
+            val encrypted = FastDnsCrypto.aesGcmEncrypt(sk, iv, chunkData)
 
-        val qname = "${labels.joinToString(".")}.s$sessionHex.$zone."
+            // Wire frame: [seq u16 BE][chunkIdx u8][totalChunks u8][0xF1][iv (12)][ciphertext]
+            val enc = byteArrayOf(0xF1.toByte()) + iv + encrypted
+            val frame = byteArrayOf(
+                (seq shr 8).toByte(),
+                (seq and 0xFF).toByte(),
+                chunkIdx.toByte(),
+                totalChunks.toByte()
+            ) + enc
 
-        // Send query and read acknowledgment
-        sendDnsQuery(out, inp, qname)
+            // Base32 encode
+            val b32 = FastDnsCrypto.base32Encode(frame)
+            val labels = b32.chunked(60)
+
+            val qname = "0-${labels.joinToString(".")}.s$sessionHex.$zone."
+
+            // Send query and read acknowledgment
+            sendDnsQuery(out, inp, qname)
+        }
+
         bytesSent.addAndGet(data.size.toLong())
     }
 
@@ -324,7 +356,7 @@ class FastDnsEngine(
                     }
                 }
 
-                val pSeq = pollSeq.getAndIncrement()
+                val pSeq = pollSeq.getAndIncrement() and 0xFFFF
                 val rand = (100000..999999).random()
                 val qname = "0-poll.$shortSess.$pSeq.$rand.s$assignedIp.$zone."
 
@@ -354,7 +386,12 @@ class FastDnsEngine(
     private fun processDownlink(data: ByteArray) {
         if (data.size <= 4) return
         val text = String(data, Charsets.UTF_8)
-        if (text == "ok" || text == "gone") return
+        if (text == "ok") return
+        if (text == "gone") {
+            Log.w(TAG, "Downlink poll returned 'gone' — rotating account...")
+            rotateAccountAndReconnect()
+            return
+        }
 
         val sk = sessionKey ?: return
         if (data.size > 29 && (data[0].toInt() and 0xFF) == 0xF1) {
@@ -388,6 +425,62 @@ class FastDnsEngine(
                 Log.w(TAG, "Downlink decrypt/decompress error: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Performs a seamless account rotation when current session expires.
+     */
+    private fun rotateAccountAndReconnect() {
+        if (!rotating.compareAndSet(false, true)) return
+        Thread(Runnable {
+            try {
+                onStatusChange?.invoke("Rotating session...")
+                Log.i(TAG, "Rotating to next account in pool...")
+                val ok = performHandshake()
+                if (ok) {
+                    onStatusChange?.invoke("FastDNS Connected ✓ ($assignedIp)")
+                    Log.i(TAG, "Account rotated successfully! sid=$sessionHex, ip=$assignedIp")
+                } else {
+                    Log.e(TAG, "Account rotation failed to handshake")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Account rotation error: ${e.message}", e)
+            } finally {
+                rotating.set(false)
+            }
+        }, "FastDNS-Rotate").start()
+    }
+
+    /**
+     * Continuously replenishes the account pool with freshly provisioned accounts
+     * every 10 minutes while tunnel is active.
+     */
+    private fun startBackgroundReplenishment() {
+        Thread(Runnable {
+            while (running.get()) {
+                try {
+                    Thread.sleep(10 * 60 * 1000) // 10 minutes
+                    if (!isConnected.get() || !running.get()) continue
+
+                    val randomBytes = ByteArray(8)
+                    SecureRandom().nextBytes(randomBytes)
+                    val newHwid = FastDnsCrypto.bytesToHex(randomBytes)
+
+                    Log.i(TAG, "Provisioning fresh account $newHwid in background...")
+                    val ok = FastDnsCrypto.provisionAccount(newHwid)
+                    if (ok) {
+                        accountPool.add(newHwid)
+                        Log.i(TAG, "Background provisioned new account $newHwid! Pool size: ${accountPool.size}")
+                    } else {
+                        Log.w(TAG, "Background provisioning for $newHwid failed")
+                    }
+                } catch (_: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "Background replenishment notice: ${e.message}")
+                }
+            }
+        }, "FastDNS-Replenish").start()
     }
 
     // ---- Zstandard Helpers ----
